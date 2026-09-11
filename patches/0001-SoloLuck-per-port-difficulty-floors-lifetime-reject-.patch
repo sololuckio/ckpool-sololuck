@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SoloLuck ops <releases@sololuck.io>
+Date: Wed, 19 Aug 2026 20:53:09 +0000
+Subject: [PATCH 1/5] SoloLuck: per-port difficulty floors, lifetime reject
+ counters, donation address
+
+Adds a serverdiff array to the config, one entry per serverurl. Each entry is
+the minimum share difficulty for that port, enforced in two places: when a
+client connects, the floor becomes its suggested difficulty (and its current
+difficulty, if the start difficulty is lower); and a mining.suggest_difficulty
+below the floor is raised to it. Neither path can take a client below the
+floor of the port it connected on.
+
+Adds diff-weighted lifetime reject counters per user and per worker to the
+stats JSON, and logs the server a client authorised on.
+
+Repoints donaddress from upstream's address to SoloLuck's. ckpool builds a
+donation output only when "donation" in the config is at least 0.1, and
+SoloLuck's pools run with it at 0, so no donation output is built and nothing
+is paid to this address. In solo mode with no btcaddress configured, ckpool
+also uses this address to check that it can build a coinbase; it is never
+mined to.
+
+Rebased onto ckpool v1.2.0.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/ckpool.c     | 43 ++++++++++++++++++++++++++++++++++++++++++-
+ src/ckpool.h     |  1 +
+ src/stratifier.c | 38 ++++++++++++++++++++++++++++++++------
+ 3 files changed, 75 insertions(+), 7 deletions(-)
+
+diff --git a/src/ckpool.c b/src/ckpool.c
+index cc6b2edc..d83287f7 100644
+--- a/src/ckpool.c
++++ b/src/ckpool.c
+@@ -1388,6 +1388,7 @@ static bool parse_serverurls(yyjson_val *arr_val)
+ 	ckpool.serverurls = arr_size;
+ 	ckpool.serverurl = ckalloc(sizeof(char *) * arr_size);
+ 	ckpool.server_highdiff = ckzalloc(sizeof(bool) * arr_size);
++	ckpool.serverdiff = ckzalloc(sizeof(int64_t) * arr_size);
+ 	ckpool.nodeserver = ckzalloc(sizeof(bool) * arr_size);
+ 	ckpool.trusted = ckzalloc(sizeof(bool) * arr_size);
+ 	for (i = 0; i < arr_size; i++) {
+@@ -1401,6 +1402,43 @@ out:
+ 	return ret;
+ }
+ 
++/* Optional per-server difficulty array, index-aligned to serverurl. Each
++ * positive entry sets the starting/floor (vardiff minimum) difficulty for
++ * connections on that server binding. A zero (or missing/short) entry leaves
++ * that server on the default behaviour (vardiff from startdiff, or highdiff
++ * for high port servers). Must be parsed after parse_serverurls so that
++ * ckpool.serverdiff is already allocated. */
++static void parse_serverdiffs(yyjson_val *arr_val)
++{
++	int arr_size, i;
++
++	if (!arr_val)
++		return;
++	if (!yyjson_is_arr(arr_val)) {
++		LOGWARNING("Unable to parse serverdiff entries as an array");
++		return;
++	}
++	if (!ckpool.serverdiff) {
++		LOGWARNING("serverdiff specified but no serverurl array allocated");
++		return;
++	}
++	arr_size = yyjson_arr_size(arr_val);
++	for (i = 0; i < arr_size && i < ckpool.serverurls; i++) {
++		yyjson_val *val = yyjson_arr_get(arr_val, i);
++
++		if (!val || !yyjson_is_int(val)) {
++			LOGWARNING("Invalid serverdiff entry number %d, leaving default", i);
++			continue;
++		}
++		ckpool.serverdiff[i] = yyjson_get_sint(val);
++		LOGNOTICE("Server %d (%s) serverdiff floor set to %"PRId64, i,
++			  ckpool.serverurl[i] ? ckpool.serverurl[i] : "?", ckpool.serverdiff[i]);
++	}
++	if (arr_size != ckpool.serverurls)
++		LOGWARNING("serverdiff array size %d does not match serverurl count %d",
++			   arr_size, ckpool.serverurls);
++}
++
+ static void parse_nodeservers(yyjson_val *arr_val)
+ {
+ 	int arr_size, i, j, total_urls;
+@@ -1547,6 +1585,9 @@ static void parse_config(void)
+ 			ckpool.serverurls = 1;
+ 		}
+ 	}
++	/* Optional per-server difficulty floors, index-aligned to serverurl */
++	arr_val = yyjson_obj_get(json_conf, "serverdiff");
++	parse_serverdiffs(arr_val);
+ 	arr_val = yyjson_obj_get(json_conf, "nodeserver");
+ 	parse_nodeservers(arr_val);
+ 	arr_val = yyjson_obj_get(json_conf, "trusted");
+@@ -1831,7 +1872,7 @@ int main(int argc, char **argv)
+ 			ckpool.btcdpass[i] = strdup("pass");
+ 	}
+ 
+-	ckpool.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
++	ckpool.donaddress = "bc1q9t8v8e29xhhxlj3tt5ulj4dxal8ud3wreessha";
+ 
+ 	/* Donations on testnet are meaningless but required for complete
+ 	 * testing. Testnet and regtest addresses */
+diff --git a/src/ckpool.h b/src/ckpool.h
+index 2df730ee..9cea7382 100644
+--- a/src/ckpool.h
++++ b/src/ckpool.h
+@@ -277,6 +277,7 @@ struct ckpool_instance {
+ 	char **serverurl; // Array of URLs to bind our server/proxy to
+ 	int serverurls; // Number of server bindings
+ 	bool *server_highdiff; // If this server is highdiff
++	int64_t *serverdiff; // Per-server starting/floor difficulty (0 = use default/highdiff behaviour)
+ 	bool *nodeserver; // If this server URL serves node information
+ 	int nodeservers; // If this server has remote node servers
+ 	bool *trusted; // If this server URL accepts trusted remote nodes
+diff --git a/src/stratifier.c b/src/stratifier.c
+index 0e8ef0f6..d1313ca9 100644
+--- a/src/stratifier.c
++++ b/src/stratifier.c
+@@ -154,6 +154,7 @@ struct user_instance {
+ 	int64_t best_ever; /* Best share ever found by this user */
+ 
+ 	int64_t shares;
++	int64_t rejects; /* Diff-weighted rejected shares, lifetime */
+ 
+ 	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
+ 
+@@ -184,6 +185,7 @@ struct worker_instance {
+ 	worker_instance_t *prev;
+ 
+ 	int64_t shares;
++	int64_t rejects; /* Diff-weighted rejected shares, lifetime */
+ 
+ 	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
+ 
+@@ -3706,7 +3708,17 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
+ 		server = 0;
+ 	client->server = server;
+ 	client->diff = client->old_diff = ckpool.startdiff;
+-	if (ckpool.server_highdiff && ckpool.server_highdiff[server]) {
++	/* A per-server difficulty floor takes precedence over the single global
++	 * highdiff. serverdiff[server] becomes this client's suggest_diff, which
++	 * the vardiff algorithm then treats as the minimum (floor) difficulty for
++	 * this connection. Applies regardless of port (so low ports can also have
++	 * an elevated floor). Falls back to the existing highdiff behaviour when
++	 * no per-server difficulty is configured for this server. */
++	if (ckpool.serverdiff && ckpool.serverdiff[server] > 0) {
++		client->suggest_diff = ckpool.serverdiff[server];
++		if (client->suggest_diff > client->diff)
++			client->diff = client->old_diff = client->suggest_diff;
++	} else if (ckpool.server_highdiff && ckpool.server_highdiff[server]) {
+ 		client->suggest_diff = ckpool.highdiff;
+ 		if (client->suggest_diff > client->diff)
+ 			client->diff = client->old_diff = client->suggest_diff;
+@@ -5587,6 +5599,7 @@ static void read_userstats(sdata_t *sdata, int tvsec_diff)
+ 		yyjson_obj_get_int(&lastshare, val, "lastshare");
+ 		user->last_share.tv_sec = lastshare;
+ 		yyjson_obj_get_int64(&user->shares, val, "shares");
++		yyjson_obj_get_int64(&user->rejects, val, "rejects");
+ 		yyjson_obj_get_double(&user->best_diff, val, "bestshare");
+ 		yyjson_obj_get_int64(&user->best_ever, val, "bestever");
+ 		yyjson_obj_get_int64(&authorised, val, "authorised");
+@@ -5630,6 +5643,7 @@ static void read_userstats(sdata_t *sdata, int tvsec_diff)
+ 			if (worker->best_diff > worker->best_ever)
+ 				worker->best_ever = worker->best_diff;
+ 			yyjson_obj_get_int64(&worker->shares, arr_val, "shares");
++			yyjson_obj_get_int64(&worker->rejects, arr_val, "rejects");
+ 			LOGINFO("Successfully read worker %s stats %f %f %f %f %f %ld", worker->workername,
+ 				worker->dsps1, worker->dsps5, worker->dsps60, worker->dsps1440, worker->best_diff, worker->best_ever);
+ 			if (tvsec_diff > 60)
+@@ -5811,9 +5825,10 @@ static void client_auth(stratum_instance_t *client, user_instance_t *user,
+ 			if (ckpool.userproxy)
+ 				check_global_user(user, client);
+ 		} else {
+-			LOGNOTICE("Authorised client %s %s worker %s as user %s",
++			LOGNOTICE("Authorised client %s %s worker %s as user %s on server %s",
+ 				  client->identity, client->address, client->workername,
+-				  user->username);
++				  user->username,
++				  (client->server < ckpool.serverurls ? ckpool.serverurl[client->server] : "?"));
+ 		}
+ 		user->failed_authtime = 0;
+ 		user->auth_backoff = DEFAULT_AUTH_BACKOFF; /* Reset auth backoff time */
+@@ -6000,8 +6015,11 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
+ 	if (valid) {
+ 		ckp_sdata->stats.unaccounted_shares++;
+ 		ckp_sdata->stats.unaccounted_diff_shares += diff;
+-	} else
++	} else {
+ 		ckp_sdata->stats.unaccounted_rejects += diff;
++		worker->rejects += diff;
++		user->rejects += diff;
++	}
+ 	mutex_unlock(&ckp_sdata->uastats_lock);
+ 
+ 	/* Count only accepted and stale rejects in diff calculation. */
+@@ -6914,6 +6932,12 @@ static void suggest_diff(stratum_instance_t *client, const char *method,
+ 	/* Clamp suggest diff to global pool mindiff */
+ 	if (sdiff < ckpool.mindiff)
+ 		sdiff = ckpool.mindiff;
++	/* Enforce any per-server difficulty floor so a client cannot suggest its
++	 * way below the tier configured for the port it connected on. */
++	if (ckpool.serverdiff && client->server < ckpool.serverurls &&
++	    ckpool.serverdiff[client->server] > 0 &&
++	    sdiff < ckpool.serverdiff[client->server])
++		sdiff = ckpool.serverdiff[client->server];
+ 	if (sdiff == client->suggest_diff)
+ 		return;
+ 	client->suggest_diff = sdiff;
+@@ -8566,7 +8590,7 @@ static void *statsupdate(void __maybe_unused *arg)
+ 			ghs = user->dsps10080 * nonces;
+ 			suffix_string(ghs, suffix10080, 16, 0);
+ 
+-			doc = yyjson_mut_pack("{ss,ss,ss,ss,ss,sI,si,sI,sf,sI,sI}",
++			doc = yyjson_mut_pack("{ss,ss,ss,ss,ss,sI,si,sI,sI,sf,sI,sI}",
+ 				"hashrate1m", suffix1,
+ 				"hashrate5m", suffix5,
+ 				"hashrate1hr", suffix60,
+@@ -8575,6 +8599,7 @@ static void *statsupdate(void __maybe_unused *arg)
+ 			        "lastshare", user->last_share.tv_sec,
+ 				"workers", user->workers + user->remote_workers,
+ 				"shares", user->shares,
++				"rejects", user->rejects,
+ 				"bestshare", user->best_diff,
+ 				"bestever", user->best_ever,
+ 				"authorised", user->auth_time);
+@@ -8632,7 +8657,7 @@ static void *statsupdate(void __maybe_unused *arg)
+ 
+ 				LOGDEBUG("Storing worker %s", worker->workername);
+ 
+-				wval = yyjson_mut_pack_val(doc, "{ss,ss,ss,ss,ss,ss,sI,sI,sf,sI}",
++				wval = yyjson_mut_pack_val(doc, "{ss,ss,ss,ss,ss,ss,sI,sI,sI,sf,sI}",
+ 					"workername", worker->workername,
+ 					"hashrate1m", suffix1,
+ 					"hashrate5m", suffix5,
+@@ -8641,6 +8666,7 @@ static void *statsupdate(void __maybe_unused *arg)
+ 					"hashrate7d", suffix10080,
+ 				        "lastshare", worker->last_share.tv_sec,
+ 					"shares", worker->shares,
++					"rejects", worker->rejects,
+ 					"bestshare", worker->best_diff,
+ 					"bestever", worker->best_ever);
+ 				yyjson_mut_arr_append(workers_arr, wval);

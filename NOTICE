@@ -1,0 +1,42 @@
+SoloLuck's ckpool patches
+=========================
+
+This repository contains modifications to ckpool, a Bitcoin mining pool server.
+
+UPSTREAM WORK
+-------------
+  ckpool
+  Copyright (C) 2014-2026 Con Kolivas
+  https://bitbucket.org/ckolivas/ckpool
+  Licensed under the GNU General Public License, version 3 or later.
+
+  The patches in patches/ are diffs against ckpool v1.2.0, commit
+  2e44101e2da2c11f499be76d16e6a26cd95cfea7. They contain unmodified lines of
+  ckpool source as diff context and as removed lines. Those lines remain the
+  copyright of Con Kolivas.
+
+MODIFICATIONS
+-------------
+  Copyright (C) 2026 SoloLuck (sololuck.io)
+  Licensed under the GNU General Public License, version 3 or later.
+
+  Files touched: src/bitcoin.c, src/bitcoin.h, src/ckpool.c, src/ckpool.h,
+  src/generator.c, src/generator.h, src/stratifier.c
+  floorcheck.py and apply.sh are SoloLuck's own helper scripts.
+
+  SPDX-License-Identifier: GPL-3.0-or-later
+
+  All five patches were written with an AI assistant (Claude); each commit
+  message carries a Co-Authored-By trailer that records it.
+
+WHAT IS NOT COVERED BY THIS NOTICE
+----------------------------------
+  SoloLuck's website and its miner are separate works under the MIT licence and
+  are NOT in this repository. See https://github.com/sololuckio/sololuck
+
+  No file in this repository is offered under the MIT licence or any licence
+  other than GPL-3.0-or-later.
+
+FULL LICENCE TEXT
+-----------------
+  COPYING (verbatim GNU GPL v3, md5 d32239bcb673463ab874e80d47fae504)

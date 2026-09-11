@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SoloLuck ops <releases@sololuck.io>
+Date: Thu, 3 Sep 2026 16:33:04 +0000
+Subject: [PATCH 4/5] SoloLuck: dedicated per-node block submit connsocks
+
+A solved block is now submitted to every configured bitcoind from its own
+thread on a private connsock (own socket + semaphore) built from the config
+strings, never the shared getblocktemplate connection; 8 s x 3 attempts per
+node, caller bounded to 44 s, returns on first acceptance; preciousblock is
+issued by each accepting node.
+
+Proven on regtest: a hung primary node went from 90.7 s to 3 ms, and a
+stalled getblocktemplate socket from 119.5 s to 21 ms.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/bitcoin.c   |  48 ++++++++--
+ src/bitcoin.h   |   2 +
+ src/ckpool.c    |  18 ++--
+ src/ckpool.h    |   1 +
+ src/generator.c | 232 +++++++++++++++++++++++++++++++++++++++++-------
+ 5 files changed, 257 insertions(+), 44 deletions(-)
+
+diff --git a/src/bitcoin.c b/src/bitcoin.c
+index e6256a79..0b250e9c 100644
+--- a/src/bitcoin.c
++++ b/src/bitcoin.c
+@@ -370,7 +370,11 @@ out:
+ 	return ret;
+ }
+ 
+-bool submit_block(connsock_t *cs, const char *params)
++/* SoloLuck: submit_block with a caller chosen per-attempt timeout (seconds)
++ * and attempt count. submit_block() below keeps the historical RPC_TIMEOUT x 5
++ * for the proxy paths; generator_submitblock uses short, bounded attempts on
++ * a private connsock per bitcoind. */
++bool submit_block_timeout(connsock_t *cs, const char *params, float timeout, int attempts)
+ {
+ 	yyjson_doc *doc;
+ 	yyjson_val *root, *res_val;
+@@ -383,18 +387,18 @@ bool submit_block(connsock_t *cs, const char *params)
+ retry:
+ 	rpc_req = ckalloc(len);
+ 	sprintf(rpc_req, "{\"method\": \"submitblock\", \"params\": [\"%s\"]}\n", params);
+-	doc = yyjson_rpc_call(cs, rpc_req);
++	doc = yyjson_rpc_call_timeout(cs, rpc_req, timeout);
+ 	dealloc(rpc_req);
+ 	if (!doc) {
+ 		LOGWARNING("%s:%s Failed to get valid json response to submitblock", cs->url, cs->port);
+-		if (++retries < 5)
++		if (++retries < attempts)
+ 			goto retry;
+ 		return ret;
+ 	}
+ 	root = yyjson_doc_get_root(doc);
+ 	if (unlikely(!root)) {
+ 		LOGERR("Failed to get json root in response to submitblock");
+-		if (++retries < 5) {
++		if (++retries < attempts) {
+ 			yyjson_doc_free(doc);
+ 			goto retry;
+ 		}
+@@ -403,7 +407,7 @@ retry:
+ 	res_val = yyjson_obj_get(root, "result");
+ 	if (!res_val) {
+ 		LOGWARNING("Failed to get result in json response to submitblock");
+-		if (++retries < 5) {
++		if (++retries < attempts) {
+ 			yyjson_doc_free(doc);
+ 			goto retry;
+ 		}
+@@ -412,7 +416,7 @@ retry:
+ 	if (!yyjson_is_null(res_val)) {
+ 		res_ret = yyjson_get_str(res_val);
+ 		if (res_ret && strlen(res_ret)) {
+-			LOGWARNING("SUBMIT BLOCK RETURNED: %s", res_ret);
++			LOGWARNING("SUBMIT BLOCK RETURNED: %s (%s:%s)", res_ret, cs->url, cs->port);
+ 			/* Consider duplicate response as an accepted block */
+ 			if (safecmp(res_ret, "duplicate"))
+ 				goto out;
+@@ -421,13 +425,43 @@ retry:
+ 			goto out;
+ 		}
+ 	}
+-	LOGWARNING("BLOCK ACCEPTED!");
++	LOGWARNING("BLOCK ACCEPTED! (%s:%s)", cs->url, cs->port);
+ 	ret = true;
+ out:
+ 	yyjson_doc_free(doc);
+ 	return ret;
+ }
+ 
++bool submit_block(connsock_t *cs, const char *params)
++{
++	return submit_block_timeout(cs, params, RPC_TIMEOUT, 5);
++}
++
++/* SoloLuck: preciousblock with a bounded wait, used on the block submit
++ * connsock of every bitcoind that accepted the block. */
++void precious_block_timeout(connsock_t *cs, const char *params, float timeout)
++{
++	yyjson_doc *doc;
++	char *rpc_req;
++	int len;
++
++	if (unlikely(!cs->alive)) {
++		LOGDEBUG("Failed to precious_block due to connsock dead");
++		return;
++	}
++
++	len = strlen(params) + 64;
++	rpc_req = ckalloc(len);
++	sprintf(rpc_req, "{\"method\": \"preciousblock\", \"params\": [\"%s\"]}\n", params);
++	doc = yyjson_rpc_call_timeout(cs, rpc_req, timeout);
++	dealloc(rpc_req);
++	if (doc)
++		LOGNOTICE("preciousblock %s sent to %s:%s", params, cs->url, cs->port);
++	else
++		LOGWARNING("preciousblock %s got no response from %s:%s", params, cs->url, cs->port);
++	yyjson_doc_free(doc);
++}
++
+ void precious_block(connsock_t *cs, const char *params)
+ {
+ 	char *rpc_req;
+diff --git a/src/bitcoin.h b/src/bitcoin.h
+index 92978324..d61faa58 100644
+--- a/src/bitcoin.h
++++ b/src/bitcoin.h
+@@ -20,7 +20,9 @@ int get_blockcount(connsock_t *cs);
+ bool get_blockhash(connsock_t *cs, int height, char *hash);
+ bool get_bestblockhash(connsock_t *cs, char *hash);
+ bool submit_block(connsock_t *cs, const char *params);
++bool submit_block_timeout(connsock_t *cs, const char *params, float timeout, int attempts);
+ void precious_block(connsock_t *cs, const char *params);
++void precious_block_timeout(connsock_t *cs, const char *params, float timeout);
+ void submit_txn(connsock_t *cs, const char *params);
+ char *get_txn(connsock_t *cs, const char *hash);
+ 
+diff --git a/src/ckpool.c b/src/ckpool.c
+index d83287f7..4f132dff 100644
+--- a/src/ckpool.c
++++ b/src/ckpool.c
+@@ -756,9 +756,11 @@ static const char *rpc_method(const char *rpc_req)
+ 
+ /* All of these calls are made to bitcoind which prefers open/close instead
+  * of persistent connections so cs->fd is always invalid. */
+-static yyjson_doc *_yyjson_rpc_call(connsock_t *cs, const char *rpc_req, const bool info_only)
++/* SoloLuck: timeout is the total number of seconds allowed for the answer.
++ * The generic wrappers pass RPC_TIMEOUT; the block submit path passes
++ * something much shorter so a hung bitcoind can never hold up the others. */
++static yyjson_doc *_yyjson_rpc_call(connsock_t *cs, const char *rpc_req, const bool info_only, float timeout)
+ {
+-	float timeout = RPC_TIMEOUT;
+ 	char *http_req = NULL;
+ 	char *warning = NULL;
+ 	yyjson_doc *doc = NULL;
+@@ -880,19 +882,25 @@ out:
+ 
+ yyjson_doc *yyjson_rpc_call(connsock_t *cs, const char *rpc_req)
+ {
+-	return _yyjson_rpc_call(cs, rpc_req, false);
++	return _yyjson_rpc_call(cs, rpc_req, false, RPC_TIMEOUT);
++}
++
++/* SoloLuck: as yyjson_rpc_call but with a caller chosen timeout in seconds */
++yyjson_doc *yyjson_rpc_call_timeout(connsock_t *cs, const char *rpc_req, float timeout)
++{
++	return _yyjson_rpc_call(cs, rpc_req, false, timeout);
+ }
+ 
+ yyjson_doc *yyjson_rpc_response(connsock_t *cs, const char *rpc_req)
+ {
+-	return _yyjson_rpc_call(cs, rpc_req, true);
++	return _yyjson_rpc_call(cs, rpc_req, true, RPC_TIMEOUT);
+ }
+ 
+ /* For when we are submitting information that is not important and don't care
+  * about the response. */
+ void yyjson_rpc_msg(connsock_t *cs, const char *rpc_req)
+ {
+-	yyjson_doc *doc = _yyjson_rpc_call(cs, rpc_req, true);
++	yyjson_doc *doc = _yyjson_rpc_call(cs, rpc_req, true, RPC_TIMEOUT);
+ 
+ 	/* We don't care about the result */
+ 	yyjson_doc_free(doc);
+diff --git a/src/ckpool.h b/src/ckpool.h
+index 9cea7382..effedf48 100644
+--- a/src/ckpool.h
++++ b/src/ckpool.h
+@@ -391,6 +391,7 @@ char *_send_recv_proc(const proc_instance_t *pi, const char *msg, int writetimeo
+ yyjson_doc *yyjson_rpc_call(connsock_t *cs, const char *rpc_req);
+ yyjson_doc *yyjson_rpc_response(connsock_t *cs, const char *rpc_req);
+ void yyjson_rpc_msg(connsock_t *cs, const char *rpc_req);
++yyjson_doc *yyjson_rpc_call_timeout(connsock_t *cs, const char *rpc_req, float timeout);
+ 
+ bool _send_yyjson_msg(connsock_t *cs, yyjson_mut_doc *doc, const char *file, const char *func, const int line);
+ #define send_yyjson_msg(CS, DOC) _send_yyjson_msg(CS, DOC, __FILE__, __func__, __LINE__)
+diff --git a/src/generator.c b/src/generator.c
+index 8c383bd7..a4d9d0b7 100644
+--- a/src/generator.c
++++ b/src/generator.c
+@@ -345,21 +345,124 @@ static void clear_unix_msg(unix_msg_t **umsg)
+ 	}
+ }
+ 
++/* SoloLuck 2026-09-03: a solved block must never wait on the template
++ * connection. The old path pushed submitblock through the current server's
++ * connsock (serialised on cs->sem with getblocktemplate, RPC_TIMEOUT 60 s,
++ * 5 attempts) and only then tried the other bitcoinds one after another, so a
++ * hung primary (TCP open, never answers) could sit on a solved block for
++ * minutes. Now every configured bitcoind gets its own throw-away connsock
++ * (own socket, own semaphore) in its own thread, each submitblock attempt is
++ * bounded to SUBMIT_RPC_TIMEOUT seconds and SUBMIT_RPC_ATTEMPTS attempts,
++ * preciousblock goes to every node that accepted, and the caller returns as
++ * soon as any node has accepted (or every node has given up). */
++static const char __attribute__((used)) sololuck_submit_marker[] = "SoloLuck-submit-fanout-20260903";
++
++#define SUBMIT_RPC_TIMEOUT 8	/* seconds to wait for a submitblock/preciousblock answer, per attempt */
++#define SUBMIT_RPC_ATTEMPTS 3	/* attempts per bitcoind: ~24 s on a hung node, then it is given up on */
++/* Hard upper bound on how long the caller (the stratifier) can block. Each
++ * thread is already bounded by connect (5 s) + SUBMIT_RPC_TIMEOUT per attempt. */
++#define SUBMIT_WAIT_MAX_MS ((5 + SUBMIT_RPC_TIMEOUT) * SUBMIT_RPC_ATTEMPTS * 1000 + 5000)
++
++struct block_submit {
++	mutex_t lock;
++	pthread_cond_t cond;
++	char *blockhex;		/* raw block hex, read only once the threads start */
++	char blockhash[68];	/* display order hash of the header, for preciousblock */
++	tv_t start;
++	int servers;		/* threads spawned */
++	int finished;		/* threads done */
++	int accepted;		/* nodes that accepted (bitcoin.c counts "duplicate" as accepted) */
++	int refs;		/* threads + the caller; the last one out frees */
++};
++
++typedef struct block_submit block_submit_t;
++
++struct block_submit_server {
++	block_submit_t *bs;
++	char *url;
++	char *port;
++	char *auth;
++};
++
++typedef struct block_submit_server block_submit_server_t;
++
++static void block_submit_put(block_submit_t *bs)
++{
++	bool last;
++
++	mutex_lock(&bs->lock);
++	last = !--bs->refs;
++	mutex_unlock(&bs->lock);
++	if (!last)
++		return;
++	pthread_cond_destroy(&bs->cond);
++	pthread_mutex_destroy(&bs->lock.mutex);
++	free(bs->blockhex);
++	free(bs);
++}
++
++/* One thread per configured bitcoind: submit the block on a private connsock
++ * that shares nothing with the getblocktemplate connection, then mark it
++ * precious on the nodes that accepted it. */
++static void *block_submit_thread(void *arg)
++{
++	block_submit_server_t *bss = arg;
++	block_submit_t *bs = bss->bs;
++	connsock_t cs;
++	double elapsed;
++	tv_t now;
++	bool ok;
++
++	pthread_detach(pthread_self());
++	rename_proc("bsubmit");
++
++	memset(&cs, 0, sizeof(cs));
++	cs.fd = -1;
++	cs.url = bss->url;
++	cs.port = bss->port;
++	cs.auth = bss->auth;
++	cs.alive = true;
++	cksem_init(&cs.sem);
++	cksem_post(&cs.sem);
++
++	LOGWARNING("Submitting block to %s:%s", cs.url, cs.port);
++	ok = submit_block_timeout(&cs, bs->blockhex, SUBMIT_RPC_TIMEOUT, SUBMIT_RPC_ATTEMPTS);
++	tv_time(&now);
++	elapsed = tvdiff(&now, &bs->start);
++	if (ok) {
++		LOGWARNING("Block accepted by %s:%s after %.3fs", cs.url, cs.port, elapsed);
++		if (bs->blockhash[0])
++			precious_block_timeout(&cs, bs->blockhash, SUBMIT_RPC_TIMEOUT);
++	} else
++		LOGWARNING("Block NOT accepted by %s:%s after %.3fs", cs.url, cs.port, elapsed);
++	cksem_destroy(&cs.sem);
++
++	mutex_lock(&bs->lock);
++	bs->finished++;
++	if (ok)
++		bs->accepted++;
++	pthread_cond_broadcast(&bs->cond);
++	mutex_unlock(&bs->lock);
++
++	free(bss->url);
++	free(bss->port);
++	free(bss->auth);
++	free(bss);
++	block_submit_put(bs);
++	return NULL;
++}
++
+ bool generator_submitblock(const char *buf)
+ {
+-	gdata_t *gdata = ckpool.gdata;
+-	server_instance_t *si;
+-	bool warn = false, ret;
+-	connsock_t *cs;
++	uchar header[80], hash[32], swap[32];
++	char hdrhex[161];
++	block_submit_t *bs;
++	double elapsed;
++	ts_t deadline, wait;
++	tv_t now;
++	bool ret;
+ 	int i;
+ 
+-	while (unlikely(!(si = gdata->current_si))) {
+-		if (!warn)
+-			LOGWARNING("No live current server in generator_blocksubmit! Resubmitting indefinitely!");
+-		warn = true;
+-		cksleep_ms(10);
+-	}
+-	cs = &si->cs;
+ 	/* SoloLuck: persist the raw block before submitting so a failed submit
+ 	 * can be replayed by hand: bitcoin-cli submitblock "$(cat <file>)" */
+ 	{
+@@ -377,35 +480,100 @@ bool generator_submitblock(const char *buf)
+ 			LOGWARNING("Failed to save block hex to %s", hexpath);
+ 	}
+ 	LOGNOTICE("Submitting block data!");
+-	ret = submit_block(cs, buf);
+-	/* SoloLuck: a solved block is valid on every node, so offer it to each
+-	 * other configured bitcoind too; bitcoin.c treats "duplicate" as
+-	 * accepted. This is what saves the block when the current server has
+-	 * just died and the retries above were spent on a dead socket. */
++
++	bs = ckzalloc(sizeof(block_submit_t));
++	mutex_init(&bs->lock);
++	cond_init(&bs->cond);
++	bs->blockhex = strdup(buf);
++	bs->refs = 1;	/* the caller */
++	tv_time(&bs->start);
++	/* Display order hash of the 80 byte header, for preciousblock.
++	 * hex2bin() insists on consuming the whole string, so hand it a NUL
++	 * terminated copy of just the header. */
++	if (strlen(buf) >= 160) {
++		memcpy(hdrhex, buf, 160);
++		hdrhex[160] = '\0';
++		if (hex2bin(header, hdrhex, 80)) {
++			gen_hash(header, hash, 80);
++			bswap_256(swap, hash);
++			__bin2hex(bs->blockhash, swap, 32);
++		}
++	}
++	if (!bs->blockhash[0])
++		LOGWARNING("Failed to derive the block hash from the block hex, skipping preciousblock");
++
++	/* Copy what each thread needs out of the config strings (never freed)
++	 * rather than out of si->cs, which kill_server() frees on a dead node
++	 * and which is only populated once a node has passed server_alive(). */
+ 	for (i = 0; i < ckpool.btcds; i++) {
+-		server_instance_t *osi = ckpool.servers[i];
++		server_instance_t *si = ckpool.servers[i];
++		char *url = NULL, *port = NULL, *userpass;
++		block_submit_server_t *bss;
++		pthread_t pth;
+ 
+-		if (!osi || osi == si || !osi->cs.url || !osi->cs.auth)
++		if (!si || !si->url || !si->auth || !si->pass)
+ 			continue;
+-		LOGWARNING("Also submitting block to %s:%s", osi->cs.url, osi->cs.port);
+-		if (submit_block(&osi->cs, buf))
+-			ret = true;
++		if (!extract_sockaddr(si->url, &url, &port)) {
++			LOGWARNING("Failed to extract address from %s for block submit", si->url);
++			continue;
++		}
++		userpass = strdup(si->auth);
++		realloc_strcat(&userpass, ":");
++		realloc_strcat(&userpass, si->pass);
++		bss = ckzalloc(sizeof(block_submit_server_t));
++		bss->auth = http_base64(userpass);
++		dealloc(userpass);
++		if (!bss->auth) {
++			LOGWARNING("Failed to create base64 auth for %s for block submit", si->url);
++			free(url);
++			free(port);
++			free(bss);
++			continue;
++		}
++		bss->bs = bs;
++		bss->url = url;
++		bss->port = port;
++		mutex_lock(&bs->lock);
++		bs->servers++;
++		bs->refs++;
++		mutex_unlock(&bs->lock);
++		create_pthread(&pth, block_submit_thread, bss);
++	}
++
++	if (!bs->servers) {
++		LOGWARNING("No bitcoind configured to submit the block to!");
++		block_submit_put(bs);
++		return false;
+ 	}
++
++	/* Return as soon as one node accepts, or once every node has given up;
++	 * slower threads carry on in the background and log their own outcome. */
++	tv_time(&now);
++	tv_to_ts(&deadline, &now);
++	ms_to_ts(&wait, SUBMIT_WAIT_MAX_MS);
++	timeraddspec(&deadline, &wait);
++	mutex_lock(&bs->lock);
++	while (!bs->accepted && bs->finished < bs->servers) {
++		if (cond_timedwait(&bs->cond, &bs->lock, &deadline) == ETIMEDOUT)
++			break;
++	}
++	ret = bs->accepted > 0;
++	tv_time(&now);
++	elapsed = tvdiff(&now, &bs->start);
++	LOGWARNING("Block %s: %d of %d bitcoinds accepted, %d failed, %d still trying, %.3fs after solve",
++		   ret ? "SUBMITTED" : "NOT ACCEPTED", bs->accepted, bs->servers,
++		   bs->finished - bs->accepted, bs->servers - bs->finished, elapsed);
++	mutex_unlock(&bs->lock);
++	block_submit_put(bs);
+ 	return ret;
+ }
+ 
+-void generator_preciousblock(const char *hash)
++void generator_preciousblock(const char __maybe_unused *hash)
+ {
+-	gdata_t *gdata = ckpool.gdata;
+-	server_instance_t *si;
+-	connsock_t *cs;
+-
+-	if (unlikely(!(si = gdata->current_si))) {
+-		LOGWARNING("No live current server in generator_get_blockhash");
+-		return;
+-	}
+-	cs = &si->cs;
+-	precious_block(cs, hash);
++	/* SoloLuck: preciousblock is now issued by generator_submitblock to every
++	 * bitcoind that accepted the block, on that node's own submit connsock.
++	 * The stratifier's call here is kept for API compatibility and does
++	 * nothing, so a hung template connection can never stall the caller. */
+ }
+ 
+ bool generator_get_blockhash(int height, char *hash)

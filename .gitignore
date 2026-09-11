@@ -1,0 +1,4 @@
+# apply.sh work area
+ckpool/
+build/
+*.o

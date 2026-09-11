@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SoloLuck ops <releases@sololuck.io>
+Date: Fri, 28 Aug 2026 16:59:35 +0000
+Subject: [PATCH 3/5] SoloLuck: submit solved blocks to every bitcoind, save
+ block hex; lowercase bech32 usernames
+
+A solved block is submitted to every configured bitcoind, not only the one
+that built the template, and the raw block hex is written to disk so it can
+be resubmitted by hand.
+
+bech32 is case-insensitive (BIP173) and bitcoind accepts an upper-case bech32
+address, but ckpool keyed its user table on the exact string, so a miner
+logging in as BC1Q... and as bc1q... became two accounts. bc1, tb1 and bcrt1
+usernames are now lowercased; base58 addresses are case-sensitive and left
+untouched.
+
+Tested on a regtest rig before it went to the pool.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/generator.c  | 37 +++++++++++++++++++++++++++++++++++--
+ src/stratifier.c | 15 +++++++++++++++
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/src/generator.c b/src/generator.c
+index 2230d14b..8c383bd7 100644
+--- a/src/generator.c
++++ b/src/generator.c
+@@ -9,6 +9,8 @@
+ 
+ #include "config.h"
+ 
++#include <limits.h>
++
+ #include <sys/epoll.h>
+ #include <sys/socket.h>
+ #include <math.h>
+@@ -347,8 +349,9 @@ bool generator_submitblock(const char *buf)
+ {
+ 	gdata_t *gdata = ckpool.gdata;
+ 	server_instance_t *si;
+-	bool warn = false;
++	bool warn = false, ret;
+ 	connsock_t *cs;
++	int i;
+ 
+ 	while (unlikely(!(si = gdata->current_si))) {
+ 		if (!warn)
+@@ -357,8 +360,38 @@ bool generator_submitblock(const char *buf)
+ 		cksleep_ms(10);
+ 	}
+ 	cs = &si->cs;
++	/* SoloLuck: persist the raw block before submitting so a failed submit
++	 * can be replayed by hand: bitcoin-cli submitblock "$(cat <file>)" */
++	{
++		char hexpath[PATH_MAX];
++		FILE *hf;
++
++		snprintf(hexpath, sizeof(hexpath), "%s/submitblock-%ld.hex", ckpool.logdir, (long)time(NULL));
++		hf = fopen(hexpath, "we");
++		if (hf) {
++			fputs(buf, hf);
++			fputc('\n', hf);
++			fclose(hf);
++			LOGWARNING("Block hex saved to %s for manual resubmit", hexpath);
++		} else
++			LOGWARNING("Failed to save block hex to %s", hexpath);
++	}
+ 	LOGNOTICE("Submitting block data!");
+-	return submit_block(cs, buf);
++	ret = submit_block(cs, buf);
++	/* SoloLuck: a solved block is valid on every node, so offer it to each
++	 * other configured bitcoind too; bitcoin.c treats "duplicate" as
++	 * accepted. This is what saves the block when the current server has
++	 * just died and the retries above were spent on a dead socket. */
++	for (i = 0; i < ckpool.btcds; i++) {
++		server_instance_t *osi = ckpool.servers[i];
++
++		if (!osi || osi == si || !osi->cs.url || !osi->cs.auth)
++			continue;
++		LOGWARNING("Also submitting block to %s:%s", osi->cs.url, osi->cs.port);
++		if (submit_block(&osi->cs, buf))
++			ret = true;
++	}
++	return ret;
+ }
+ 
+ void generator_preciousblock(const char *hash)
+diff --git a/src/stratifier.c b/src/stratifier.c
+index df40040b..020469b0 100644
+--- a/src/stratifier.c
++++ b/src/stratifier.c
+@@ -9,6 +9,10 @@
+ 
+ #include "config.h"
+ 
++#include <strings.h>
++
++#include <ctype.h>
++
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+@@ -5772,6 +5776,17 @@ static char *trim_username(char *username)
+ 	while (end > username && (end[-1] == ' ' || end[-1] == '\t' ||
+ 				  end[-1] == '\r' || end[-1] == '\n'))
+ 		*(--end) = '\0';
++	/* bech32/bech32m addresses are case-insensitive by spec (BIP173), and
++	 * bitcoind accepts BC1Q... as readily as bc1q..., but the user table
++	 * keys on the exact string. Fold them so both spellings are one
++	 * account. Base58 addresses are case-sensitive and left untouched. */
++	if (!strncasecmp(username, "bc1", 3) || !strncasecmp(username, "tb1", 3) ||
++	    !strncasecmp(username, "bcrt1", 5)) {
++		char *p;
++
++		for (p = username; *p; p++)
++			*p = tolower((unsigned char)*p);
++	}
+ 	return username;
+ }
+ 

@@ -1,0 +1,532 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SoloLuck ops <releases@sololuck.io>
+Date: Thu, 10 Sep 2026 11:25:59 +0000
+Subject: [PATCH 5/5] A solved block nobody answered about is UNRESOLVED, not
+ rejected
+
+Upstream ckpool never gave up on a solved block. generator_submitblock() spun on
+cksleep_ms(10) until gdata->current_si came back, logging "No live current server
+in generator_blocksubmit! Resubmitting indefinitely!". Crude, but it encoded the
+right priority: a block is the only thing this software exists to produce.
+
+The fan-out in the previous patch replaced that wait with one bounded thread per
+configured bitcoind, so a hung primary can no longer sit on a solved block for
+minutes. That was worth doing and stays. What went with it was the never-give-up
+guarantee: with every bitcoind unresponsive for the SUBMIT_WAIT_MAX_MS window
+(~44 s), generator_submitblock() returns false, and the stratifier calls
+block_reject().
+
+That is wrong twice. Nobody looked at the block, so "rejected" is a false record
+of a verdict that was never delivered; and the block is then dropped with nothing
+but a hex file on disk that no process reads.
+
+  1. bitcoin.c can now say whether bitcoind actually ANSWERED.
+     submitblock returns null (accepted), "duplicate" (already have it, also
+     accepted), or a named reason -- "high-hash", "bad-txnmrklroot" -- which is a
+     real rejection. No JSON, no root, no "result" is not a verdict, it is
+     silence. submit_block_answered() reports the difference;
+     submit_block_timeout() stays as a thin wrapper so no caller changes.
+
+  2. generator.c keeps trying. The bounded fan-out is now block_submit_round(),
+     callable repeatedly. When a round ends with no acceptance AND no verdict,
+     generator_submitblock_ex() hands the block to a detached thread that runs
+     more rounds on a 5s -> 60s backoff until some node accepts it or names a
+     reason, or SUBMIT_RETRY_MAX_S (30 min) elapses -- and if it gives up it says
+     so, with the exact bitcoin-cli line to replay the saved hex.
+
+  3. stratifier.c gains a third outcome. local_block_submit() carries an
+     *unresolved flag, and block_unresolved() records "submitted but UNRESOLVED"
+     instead of a rejection. Seeing our own hash on chain still settles it as
+     accepted; NOT seeing it settles nothing, because a node that answers
+     getblockhash but never answered submitblock has told us nothing about our
+     block.
+
+Proven on the regtest rig (2 bitcoinds, ckpool -B, cpuminer), not argued:
+
+  * Normal solve: block 205 accepted by both nodes in 9 ms, coinbase unchanged --
+    25.0 BTC to the miner's own address, one spendable output, scriptSig still
+    carrying "ckpool" and "/sololuck.io/".
+
+  * Both bitcoinds SIGSTOPped -- TCP still accepting, nothing answering, which is
+    exactly the failure this is about. Block 206 solved into the dark:
+        Block submit to 127.0.0.1:18443 got NO ANSWER after 24.024s -- this is NOT a rejection
+        Block 206 UNRESOLVED: no bitcoind returned a verdict. This is NOT a
+          rejection; resubmitting in the background for up to 1800 s.
+        Block 206 still UNRESOLVED after background resubmit round 1 (29s)
+    SIGCONT, and round 2 landed it:
+        BLOCK 206 ACCEPTED LATE: background resubmit round 2 succeeded 59s after
+          the solve. The block was never rejected.
+    Both nodes at height 206. block_reject() fired zero times in the whole run.
+    On the old code this block is logged "Submitted, but had block 206 rejected"
+    and lost.
+
+  * Genuine rejection still rejects: a block with one flipped nibble in the
+    coinbase, pushed through the generator, came back
+    "SUBMIT BLOCK RETURNED: bad-txnmrklroot" and was refused with no retry storm.
+
+Known limitation, stated rather than hidden: a block that only a LATE background
+round lands logs "BLOCK ACCEPTED LATE" but does not re-run block_solve()'s
+bookkeeping -- block_share_summary(), reset_bestshares(), the miner broadcast.
+That state belongs to the stratifier's own thread. The block is on chain and paid;
+the leaderboard reset is manual. In the test above the original caller was still
+blocked inside generator_get_blockhash() when the nodes returned, so block_solve()
+did run -- but that is luck, not design, and a longer outage would not have it.
+
+Builds clean, no warnings.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/bitcoin.c    |  21 +++++-
+ src/bitcoin.h    |   2 +
+ src/generator.c  | 169 ++++++++++++++++++++++++++++++++++++++++-------
+ src/generator.h  |   1 +
+ src/stratifier.c |  44 ++++++++++--
+ 5 files changed, 206 insertions(+), 31 deletions(-)
+
+diff --git a/src/bitcoin.c b/src/bitcoin.c
+index 0b250e9c..6fc8717c 100644
+--- a/src/bitcoin.c
++++ b/src/bitcoin.c
+@@ -374,7 +374,14 @@ out:
+  * and attempt count. submit_block() below keeps the historical RPC_TIMEOUT x 5
+  * for the proxy paths; generator_submitblock uses short, bounded attempts on
+  * a private connsock per bitcoind. */
+-bool submit_block_timeout(connsock_t *cs, const char *params, float timeout, int attempts)
++/* SoloLuck 2026-09-10: report whether bitcoind actually delivered a VERDICT.
++ * submitblock answers null (accepted), "duplicate" (already have it, also
++ * accepted), or a named reason ("high-hash", "bad-txnmrklroot", ...) which is a
++ * real rejection. Silence -- no JSON, no root, no "result" -- is NOT a verdict:
++ * it means nobody looked at the block. A solved block nobody looked at must be
++ * retried, never recorded as rejected. *answered separates the two. */
++bool submit_block_answered(connsock_t *cs, const char *params, float timeout, int attempts,
++			   bool *answered)
+ {
+ 	yyjson_doc *doc;
+ 	yyjson_val *root, *res_val;
+@@ -383,6 +390,8 @@ bool submit_block_timeout(connsock_t *cs, const char *params, float timeout, int
+ 	bool ret = false;
+ 	char *rpc_req;
+ 
++	if (answered)
++		*answered = false;
+ 	len = strlen(params) + 64;
+ retry:
+ 	rpc_req = ckalloc(len);
+@@ -417,6 +426,9 @@ retry:
+ 		res_ret = yyjson_get_str(res_val);
+ 		if (res_ret && strlen(res_ret)) {
+ 			LOGWARNING("SUBMIT BLOCK RETURNED: %s (%s:%s)", res_ret, cs->url, cs->port);
++			/* A named reason IS a verdict, even though it is a rejection. */
++			if (answered)
++				*answered = true;
+ 			/* Consider duplicate response as an accepted block */
+ 			if (safecmp(res_ret, "duplicate"))
+ 				goto out;
+@@ -425,6 +437,8 @@ retry:
+ 			goto out;
+ 		}
+ 	}
++	if (answered)
++		*answered = true;
+ 	LOGWARNING("BLOCK ACCEPTED! (%s:%s)", cs->url, cs->port);
+ 	ret = true;
+ out:
+@@ -432,6 +446,11 @@ out:
+ 	return ret;
+ }
+ 
++bool submit_block_timeout(connsock_t *cs, const char *params, float timeout, int attempts)
++{
++	return submit_block_answered(cs, params, timeout, attempts, NULL);
++}
++
+ bool submit_block(connsock_t *cs, const char *params)
+ {
+ 	return submit_block_timeout(cs, params, RPC_TIMEOUT, 5);
+diff --git a/src/bitcoin.h b/src/bitcoin.h
+index d61faa58..29f19863 100644
+--- a/src/bitcoin.h
++++ b/src/bitcoin.h
+@@ -21,6 +21,8 @@ bool get_blockhash(connsock_t *cs, int height, char *hash);
+ bool get_bestblockhash(connsock_t *cs, char *hash);
+ bool submit_block(connsock_t *cs, const char *params);
+ bool submit_block_timeout(connsock_t *cs, const char *params, float timeout, int attempts);
++bool submit_block_answered(connsock_t *cs, const char *params, float timeout, int attempts,
++			   bool *answered);
+ void precious_block(connsock_t *cs, const char *params);
+ void precious_block_timeout(connsock_t *cs, const char *params, float timeout);
+ void submit_txn(connsock_t *cs, const char *params);
+diff --git a/src/generator.c b/src/generator.c
+index a4d9d0b7..29327580 100644
+--- a/src/generator.c
++++ b/src/generator.c
+@@ -363,6 +363,18 @@ static const char __attribute__((used)) sololuck_submit_marker[] = "SoloLuck-sub
+  * thread is already bounded by connect (5 s) + SUBMIT_RPC_TIMEOUT per attempt. */
+ #define SUBMIT_WAIT_MAX_MS ((5 + SUBMIT_RPC_TIMEOUT) * SUBMIT_RPC_ATTEMPTS * 1000 + 5000)
+ 
++/* SoloLuck 2026-09-10: the fan-out above bounded how long a solved block can
++ * wait, but in doing so it removed upstream's guarantee that a solved block is
++ * NEVER given up on (upstream spun on cksleep_ms(10) until a server returned,
++ * logging "Resubmitting indefinitely!"). With every bitcoind down for the
++ * SUBMIT_WAIT_MAX_MS window, a real block was returned as false and recorded by
++ * the stratifier as REJECTED -- a false record of a block nobody had looked at.
++ * The guarantee is restored here, off the caller's thread: when no node returns
++ * a verdict, keep resubmitting in the background on a backoff until one does. */
++#define SUBMIT_RETRY_MIN_MS   5000
++#define SUBMIT_RETRY_MAX_MS  60000
++#define SUBMIT_RETRY_MAX_S    1800	/* 30 min, then the saved hex must be replayed by hand */
++
+ struct block_submit {
+ 	mutex_t lock;
+ 	pthread_cond_t cond;
+@@ -372,6 +384,7 @@ struct block_submit {
+ 	int servers;		/* threads spawned */
+ 	int finished;		/* threads done */
+ 	int accepted;		/* nodes that accepted (bitcoin.c counts "duplicate" as accepted) */
++	int answered;		/* nodes that returned a verdict at all -- silence is not one */
+ 	int refs;		/* threads + the caller; the last one out frees */
+ };
+ 
+@@ -408,6 +421,7 @@ static void *block_submit_thread(void *arg)
+ {
+ 	block_submit_server_t *bss = arg;
+ 	block_submit_t *bs = bss->bs;
++	bool answered = false;
+ 	connsock_t cs;
+ 	double elapsed;
+ 	tv_t now;
+@@ -426,21 +440,27 @@ static void *block_submit_thread(void *arg)
+ 	cksem_post(&cs.sem);
+ 
+ 	LOGWARNING("Submitting block to %s:%s", cs.url, cs.port);
+-	ok = submit_block_timeout(&cs, bs->blockhex, SUBMIT_RPC_TIMEOUT, SUBMIT_RPC_ATTEMPTS);
++	ok = submit_block_answered(&cs, bs->blockhex, SUBMIT_RPC_TIMEOUT, SUBMIT_RPC_ATTEMPTS,
++				   &answered);
+ 	tv_time(&now);
+ 	elapsed = tvdiff(&now, &bs->start);
+ 	if (ok) {
+ 		LOGWARNING("Block accepted by %s:%s after %.3fs", cs.url, cs.port, elapsed);
+ 		if (bs->blockhash[0])
+ 			precious_block_timeout(&cs, bs->blockhash, SUBMIT_RPC_TIMEOUT);
+-	} else
+-		LOGWARNING("Block NOT accepted by %s:%s after %.3fs", cs.url, cs.port, elapsed);
++	} else if (answered)
++		LOGWARNING("Block REJECTED by %s:%s after %.3fs", cs.url, cs.port, elapsed);
++	else
++		LOGWARNING("Block submit to %s:%s got NO ANSWER after %.3fs -- this is NOT a rejection",
++			   cs.url, cs.port, elapsed);
+ 	cksem_destroy(&cs.sem);
+ 
+ 	mutex_lock(&bs->lock);
+ 	bs->finished++;
+ 	if (ok)
+ 		bs->accepted++;
++	if (answered)
++		bs->answered++;
+ 	pthread_cond_broadcast(&bs->cond);
+ 	mutex_unlock(&bs->lock);
+ 
+@@ -452,7 +472,11 @@ static void *block_submit_thread(void *arg)
+ 	return NULL;
+ }
+ 
+-bool generator_submitblock(const char *buf)
++/* One bounded fan-out round: a private connsock per configured bitcoind, each
++ * thread capped at SUBMIT_RPC_ATTEMPTS x SUBMIT_RPC_TIMEOUT, returning as soon
++ * as any node accepts. Sets *answered if ANY node returned a verdict, so the
++ * caller can tell a rejection apart from silence. Safe to call repeatedly. */
++static bool block_submit_round(const char *buf, bool *answered)
+ {
+ 	uchar header[80], hash[32], swap[32];
+ 	char hdrhex[161];
+@@ -463,23 +487,8 @@ bool generator_submitblock(const char *buf)
+ 	bool ret;
+ 	int i;
+ 
+-	/* SoloLuck: persist the raw block before submitting so a failed submit
+-	 * can be replayed by hand: bitcoin-cli submitblock "$(cat <file>)" */
+-	{
+-		char hexpath[PATH_MAX];
+-		FILE *hf;
+-
+-		snprintf(hexpath, sizeof(hexpath), "%s/submitblock-%ld.hex", ckpool.logdir, (long)time(NULL));
+-		hf = fopen(hexpath, "we");
+-		if (hf) {
+-			fputs(buf, hf);
+-			fputc('\n', hf);
+-			fclose(hf);
+-			LOGWARNING("Block hex saved to %s for manual resubmit", hexpath);
+-		} else
+-			LOGWARNING("Failed to save block hex to %s", hexpath);
+-	}
+-	LOGNOTICE("Submitting block data!");
++	if (answered)
++		*answered = false;
+ 
+ 	bs = ckzalloc(sizeof(block_submit_t));
+ 	mutex_init(&bs->lock);
+@@ -558,16 +567,130 @@ bool generator_submitblock(const char *buf)
+ 			break;
+ 	}
+ 	ret = bs->accepted > 0;
++	if (answered && bs->answered)
++		*answered = true;
+ 	tv_time(&now);
+ 	elapsed = tvdiff(&now, &bs->start);
+-	LOGWARNING("Block %s: %d of %d bitcoinds accepted, %d failed, %d still trying, %.3fs after solve",
+-		   ret ? "SUBMITTED" : "NOT ACCEPTED", bs->accepted, bs->servers,
++	LOGWARNING("Block %s: %d of %d bitcoinds accepted, %d answered, %d failed, %d still trying, %.3fs after solve",
++		   ret ? "SUBMITTED" : "NOT ACCEPTED", bs->accepted, bs->servers, bs->answered,
+ 		   bs->finished - bs->accepted, bs->servers - bs->finished, elapsed);
+ 	mutex_unlock(&bs->lock);
+ 	block_submit_put(bs);
+ 	return ret;
+ }
+ 
++struct block_retry {
++	char *blockhex;
++	char hexpath[PATH_MAX];
++	int height;
++};
++
++typedef struct block_retry block_retry_t;
++
++/* Upstream's "Resubmitting indefinitely!", moved off the caller's thread. Runs
++ * only when the first round produced NO verdict from any node -- i.e. the block
++ * is unresolved, not rejected. Backs off 5s -> 60s and stops the moment any
++ * node accepts it or names a reason for refusing it. */
++static void *block_retry_thread(void *arg)
++{
++	block_retry_t *br = arg;
++	bool answered, ok = false;
++	int delay = SUBMIT_RETRY_MIN_MS, rounds = 0;
++	bool rejected = false;
++	tv_t start, now;
++
++	pthread_detach(pthread_self());
++	rename_proc("bretry");
++	tv_time(&start);
++
++	while (42) {
++		tv_time(&now);
++		if (tvdiff(&now, &start) >= SUBMIT_RETRY_MAX_S)
++			break;
++		cksleep_ms(delay);
++		delay *= 2;
++		if (delay > SUBMIT_RETRY_MAX_MS)
++			delay = SUBMIT_RETRY_MAX_MS;
++		rounds++;
++		answered = false;
++		ok = block_submit_round(br->blockhex, &answered);
++		tv_time(&now);
++		if (ok) {
++			LOGWARNING("BLOCK %d ACCEPTED LATE: background resubmit round %d succeeded "
++				   "%.0fs after the solve. The block was never rejected.",
++				   br->height, rounds, tvdiff(&now, &start));
++			break;
++		}
++		if (answered) {
++			rejected = true;
++			LOGWARNING("Block %d REJECTED by a bitcoind on background resubmit round %d, "
++				   "%.0fs after the solve", br->height, rounds, tvdiff(&now, &start));
++			break;
++		}
++		LOGWARNING("Block %d still UNRESOLVED after background resubmit round %d (%.0fs); "
++			   "no bitcoind has answered. Retrying in %ds.",
++			   br->height, rounds, tvdiff(&now, &start), delay / 1000);
++	}
++	if (!ok && !rejected)
++		LOGWARNING("Block %d GAVE UP after %d s of background resubmits and is still "
++			   "UNRESOLVED. Replay it by hand: bitcoin-cli submitblock \"$(cat %s)\"",
++			   br->height, SUBMIT_RETRY_MAX_S, br->hexpath);
++	free(br->blockhex);
++	free(br);
++	return NULL;
++}
++
++/* height is only used for the log lines; pass 0 if it is not to hand.
++ * *unresolved is set when NO bitcoind returned a verdict: the caller must not
++ * record that as a rejection, because nobody looked at the block. */
++bool generator_submitblock_ex(const char *buf, int height, bool *unresolved)
++{
++	char hexpath[PATH_MAX] = {};
++	bool answered = false, ret;
++	block_retry_t *br;
++	pthread_t pth;
++	FILE *hf;
++
++	if (unresolved)
++		*unresolved = false;
++
++	/* SoloLuck: persist the raw block before submitting so a failed submit
++	 * can be replayed by hand: bitcoin-cli submitblock "$(cat <file>)" */
++	snprintf(hexpath, sizeof(hexpath), "%s/submitblock-%ld.hex", ckpool.logdir, (long)time(NULL));
++	hf = fopen(hexpath, "we");
++	if (hf) {
++		fputs(buf, hf);
++		fputc('\n', hf);
++		fclose(hf);
++		LOGWARNING("Block hex saved to %s for manual resubmit", hexpath);
++	} else
++		LOGWARNING("Failed to save block hex to %s", hexpath);
++	LOGNOTICE("Submitting block data!");
++
++	ret = block_submit_round(buf, &answered);
++	if (ret || answered)
++		return ret;
++
++	/* No node accepted it and no node named a reason for refusing it. That is
++	 * not a rejection -- nobody looked. Keep trying in the background. */
++	if (unresolved)
++		*unresolved = true;
++	LOGWARNING("Block %d UNRESOLVED: no bitcoind returned a verdict. This is NOT a "
++		   "rejection; resubmitting in the background for up to %d s.",
++		   height, SUBMIT_RETRY_MAX_S);
++	br = ckzalloc(sizeof(block_retry_t));
++	br->blockhex = strdup(buf);
++	br->height = height;
++	snprintf(br->hexpath, sizeof(br->hexpath), "%s", hexpath);
++	create_pthread(&pth, block_retry_thread, br);
++	return false;
++}
++
++bool generator_submitblock(const char *buf)
++{
++	return generator_submitblock_ex(buf, 0, NULL);
++}
++
+ void generator_preciousblock(const char __maybe_unused *hash)
+ {
+ 	/* SoloLuck: preciousblock is now issued by generator_submitblock to every
+diff --git a/src/generator.h b/src/generator.h
+index 1af2febe..7b4abd94 100644
+--- a/src/generator.h
++++ b/src/generator.h
+@@ -23,6 +23,7 @@ bool generator_checkaddr(const char *addr, bool *script, bool *segwit);
+ char *generator_checktxn(const char *txn);
+ char *generator_get_txn(const char *hash);
+ bool generator_submitblock(const char *buf);
++bool generator_submitblock_ex(const char *buf, int height, bool *unresolved);
+ void generator_preciousblock(const char *hash);
+ bool generator_get_blockhash(int height, char *hash);
+ void *generator(void *arg);
+diff --git a/src/stratifier.c b/src/stratifier.c
+index 020469b0..2bb08278 100644
+--- a/src/stratifier.c
++++ b/src/stratifier.c
+@@ -2333,10 +2333,14 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
+ 	return gbt_block;
+ }
+ 
+-/* Submit block data locally, absorbing and freeing gbt_block */
+-static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
+-{
+-	bool ret = generator_submitblock(gbt_block);
++/* Submit block data locally, absorbing and freeing gbt_block.
++ * *unresolved (optional) comes back true when no bitcoind returned a verdict:
++ * the block is neither confirmed nor refused, and must not be recorded as
++ * rejected. The generator keeps resubmitting it in the background. */
++static bool local_block_submit(char *gbt_block, const uchar *flip32, int height,
++			       bool *unresolved)
++{
++	bool ret = generator_submitblock_ex(gbt_block, height, unresolved);
+ 	char heighthash[68] = {}, rhash[68] = {};
+ 	uchar swap256[32];
+ 
+@@ -2361,6 +2365,11 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
+ 			ret = !strncmp(rhash, heighthash, 64);
+ 			LOGWARNING("Hash for forced possibly stale block, height %d confirms block was %s",
+ 				   height, ret ? "ACCEPTED" : "REJECTED");
++			/* Seeing our hash on chain settles it. Not seeing it does not:
++			 * a node that answers getblockhash but never answered
++			 * submitblock has still told us nothing about our block. */
++			if (ret && unresolved)
++				*unresolved = false;
+ 		}
+ 	}
+ 	return ret;
+@@ -2416,6 +2425,7 @@ static void put_workbase(sdata_t *sdata, workbase_t *wb)
+ 
+ static void block_solve(yyjson_mut_doc *doc);
+ static void block_reject(yyjson_mut_doc *doc);
++static void block_unresolved(yyjson_mut_doc *doc);
+ 
+ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
+ {
+@@ -2430,6 +2440,7 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
+ 	double diff;
+ 	ts_t ts_now;
+ 	int64_t id;
++	bool unresolved = false;
+ 	bool ret;
+ 
+ 	if (unlikely(!yyjson_mut_obj_get_string(&enonce1, val, "enonce1"))) {
+@@ -2500,7 +2511,7 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
+ 
+ 	/* Now we have enough to assemble a block */
+ 	gbt_block = process_block(wb, coinbase, cblen, swap, hash, flip32, blockhash);
+-	ret = local_block_submit(gbt_block, flip32, wb->height);
++	ret = local_block_submit(gbt_block, flip32, wb->height, &unresolved);
+ 
+ 	doc = yyjson_mut_pack("{si,ss,ss,sI,ss,ss,si,ss,sI,sf,ss,ss,ss,ss}",
+ 			 "height", wb->height,
+@@ -2521,6 +2532,8 @@ static void submit_node_block(sdata_t *sdata, yyjson_mut_val *val)
+ 
+ 	if (ret)
+ 		block_solve(doc);
++	else if (unresolved)
++		block_unresolved(doc);
+ 	else
+ 		block_reject(doc);
+ 
+@@ -4176,6 +4189,20 @@ static void block_reject(yyjson_mut_doc *doc)
+ 	LOGWARNING("Submitted, but had block %d rejected", height);
+ }
+ 
++/* Third outcome: the block was submitted but no bitcoind returned a verdict on
++ * it, so it is neither confirmed nor refused. Recording that as a rejection
++ * would be a false record of a block nobody has looked at. The generator is
++ * resubmitting it in the background and logs its own outcome. */
++static void block_unresolved(yyjson_mut_doc *doc)
++{
++	int height = 0;
++
++	yyjson_mut_obj_get_int(&height, yyjson_mut_doc_get_root(doc), "height");
++
++	LOGWARNING("Block %d submitted but UNRESOLVED -- no bitcoind answered. NOT counted "
++		   "as rejected; the generator is retrying it in the background.", height);
++}
++
+ /* Some upstream pools (like p2pool) don't update stratum often enough and
+  * miners disconnect if they don't receive regular communication so send them
+  * a ping at regular intervals */
+@@ -6253,6 +6280,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
+ 	yyjson_mut_val *val;
+ 	uchar flip32[32];
+ 	ts_t ts_now;
++	bool unresolved = false;
+ 	bool ret;
+ 
+ 	/* Submit anything over 99.9% of the diff in case of rounding errors */
+@@ -6320,9 +6348,11 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
+ 		ret = ipc_submit_block(wb, data, coinbase, cblen, ntime32);
+ 	else
+ #endif
+-		ret = local_block_submit(gbt_block, flip32, wb->height);
++		ret = local_block_submit(gbt_block, flip32, wb->height, &unresolved);
+ 	if (ret)
+ 		block_solve(doc);
++	else if (unresolved)
++		block_unresolved(doc);
+ 	else
+ 		block_reject(doc);
+ 
+@@ -7675,7 +7705,7 @@ static void parse_remote_block(sdata_t *sdata, yyjson_mut_doc *doc, yyjson_mut_v
+ 		/* We rely on the remote server to give us the ID_BLOCK
+ 		 * responses, so only use this response to determine if we
+ 		 * should reset the best shares. */
+-		if (local_block_submit(gbt_block, flip32, wb->height)) {
++		if (local_block_submit(gbt_block, flip32, wb->height, NULL)) {
+ 			block_share_summary(sdata);
+ 			reset_bestshares(sdata);
+ 		}
