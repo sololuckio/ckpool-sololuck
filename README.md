@@ -47,7 +47,7 @@ hash will not. The diff against upstream is seven source files, 576 insertions, 
  7 files changed, 576 insertions(+), 47 deletions(-)
 ```
 
-That is the whole artifact. SoloLuck's two Bitcoin pools and its DigiByte pool run builds of
+That is the whole artifact. SoloLuck's Bitcoin pool and its DigiByte pool run builds of
 exactly this source. (Its Bitcoin Cash pool runs a different ckpool fork and does not use
 these patches.)
 
